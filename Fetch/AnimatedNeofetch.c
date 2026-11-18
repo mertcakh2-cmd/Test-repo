@@ -1,319 +1,205 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
+#include <time.h>
+#include <signal.h>
 #include <sys/utsname.h>
-#include <pwd.h>
 
 #define RESET "\033[0m"
 #define BOLD "\033[1m"
-#define ORANGE "\033[38;5;208m"
-#define CYAN "\033[38;5;45m"
-#define WHITE "\033[38;5;255m"
-#define MUTED "\033[38;5;244m"
+#define CYAN "\033[38;5;51m"
+#define PINK "\033[38;5;213m"
+#define WHITE "\033[97m"
 
-static int animate_output = 0;
+volatile sig_atomic_t running = 1;
 
-static void pause_ms(long milliseconds) {
-    if (!animate_output || milliseconds <= 0) return;
-
-    struct timespec delay;
-    delay.tv_sec = milliseconds / 1000;
-    delay.tv_nsec = (milliseconds % 1000) * 1000000L;
-    nanosleep(&delay, NULL);
+void stop_animation(int sig) {
+    (void)sig;
+    running = 0;
 }
 
-static void print_animated(const char *text, long delay_ms) {
-    for (const char *p = text; *p; ++p) {
-        putchar(*p);
-        fflush(stdout);
-        pause_ms(delay_ms);
-    }
+void sleep_frame(void) {
+    struct timespec t = {0, 80000000};
+    nanosleep(&t, NULL);
 }
 
-static void trim(char *text) {
-    size_t length = strlen(text);
+void get_memory(char *buffer, size_t size) {
+    FILE *f = fopen("/proc/meminfo", "r");
 
-    while (length > 0 && isspace((unsigned char)text[length - 1])) {
-        text[--length] = '\0';
+    if (!f) {
+        snprintf(buffer, size, "Unavailable");
+        return;
     }
 
-    size_t start = 0;
+    unsigned long total = 0, available = 0;
+    char line[256];
 
-    while (text[start] && isspace((unsigned char)text[start]))
-        start++;
+    while (fgets(line, sizeof(line), f)) {
+        sscanf(line, "MemTotal: %lu kB", &total);
 
-    if (start > 0)
-        memmove(text, text + start, strlen(text + start) + 1);
+        if (sscanf(line, "MemAvailable: %lu kB", &available) == 1)
+            continue;
+    }
+
+    fclose(f);
+
+    unsigned long used = total > available ? total - available : 0;
+
+    snprintf(buffer, size, "%lu MB / %lu MB",
+             used / 1024, total / 1024);
 }
 
-static void read_os_name(char *output, size_t output_size) {
-    snprintf(output, output_size, "Linux");
+void get_uptime(char *buffer, size_t size) {
+    FILE *f = fopen("/proc/uptime", "r");
 
-    FILE *file = fopen("/etc/os-release", "r");
-    if (!file) return;
+    if (!f) {
+        snprintf(buffer, size, "Unknown");
+        return;
+    }
+
+    double seconds = 0;
+    fscanf(f, "%lf", &seconds);
+    fclose(f);
+
+    int hours = (int)seconds / 3600;
+    int minutes = ((int)seconds % 3600) / 60;
+
+    snprintf(buffer, size, "%dh %dm", hours, minutes);
+}
+
+void get_os(char *buffer, size_t size) {
+    snprintf(buffer, size, "Linux");
+
+    FILE *f = fopen("/etc/os-release", "r");
+    if (!f) return;
 
     char line[512];
 
-    while (fgets(line, sizeof(line), file)) {
+    while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
-            char *value = line + 12;
-            trim(value);
+            char *p = line + 12;
+            p[strcspn(p, "\n")] = 0;
 
-            size_t length = strlen(value);
-
-            if (length >= 2 &&
-                ((value[0] == '"' && value[length - 1] == '"') ||
-                 (value[0] == '\'' && value[length - 1] == '\''))) {
-                value[length - 1] = '\0';
-                value++;
+            if (*p == '"' || *p == '\'') {
+                memmove(p, p + 1, strlen(p));
+                p[strcspn(p, "\"'")] = 0;
             }
 
-            snprintf(output, output_size, "%.*s",
-                     (int)(output_size - 1), value);
+            snprintf(buffer, size, "%s", p);
             break;
         }
     }
 
-    fclose(file);
-}
-
-static void read_cpu_name(char *output, size_t output_size) {
-    snprintf(output, output_size, "Unknown CPU");
-
-    FILE *file = fopen("/proc/cpuinfo", "r");
-    if (!file) return;
-
-    char line[512];
-
-    while (fgets(line, sizeof(line), file)) {
-        if (strstr(line, "model name") ||
-            strstr(line, "Hardware") ||
-            strstr(line, "Processor")) {
-
-            char *colon = strchr(line, ':');
-
-            if (colon) {
-                char *value = colon + 1;
-                trim(value);
-
-                if (*value)
-                    snprintf(output, output_size, "%s", value);
-
-                break;
-            }
-        }
-    }
-
-    fclose(file);
-}
-
-static void read_memory(char *output, size_t output_size) {
-    unsigned long long total_kb = 0;
-    unsigned long long available_kb = 0;
-
-    FILE *file = fopen("/proc/meminfo", "r");
-
-    if (!file) {
-        snprintf(output, output_size, "Unavailable");
-        return;
-    }
-
-    char line[256];
-
-    while (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "MemTotal: %llu kB", &total_kb) == 1)
-            continue;
-
-        if (sscanf(line, "MemAvailable: %llu kB", &available_kb) == 1)
-            continue;
-    }
-
-    fclose(file);
-
-    if (total_kb == 0) {
-        snprintf(output, output_size, "Unavailable");
-        return;
-    }
-
-    unsigned long long used_mb =
-        (total_kb - (available_kb > total_kb
-        ? total_kb : available_kb)) / 1024ULL;
-
-    unsigned long long total_mb = total_kb / 1024ULL;
-
-    snprintf(output, output_size,
-             "%llu MiB / %llu MiB", used_mb, total_mb);
-}
-
-static void read_uptime(char *output, size_t output_size) {
-    FILE *file = fopen("/proc/uptime", "r");
-
-    if (!file) {
-        snprintf(output, output_size, "Unavailable");
-        return;
-    }
-
-    double seconds = 0.0;
-
-    if (fscanf(file, "%lf", &seconds) != 1)
-        seconds = 0.0;
-
-    fclose(file);
-
-    unsigned long long total_minutes =
-        (unsigned long long)(seconds / 60.0);
-
-    unsigned long long days = total_minutes / 1440ULL;
-    unsigned long long hours = (total_minutes % 1440ULL) / 60ULL;
-    unsigned long long minutes = total_minutes % 60ULL;
-
-    if (days > 0) {
-        snprintf(output, output_size,
-                 "%llu days, %llu hours, %llu mins",
-                 days, hours, minutes);
-    } else if (hours > 0) {
-        snprintf(output, output_size,
-                 "%llu hours, %llu mins", hours, minutes);
-    } else {
-        snprintf(output, output_size, "%llu mins", minutes);
-    }
-}
-
-static const char *shell_name(void) {
-    const char *shell = getenv("SHELL");
-
-    if (!shell || !*shell)
-        return "Unknown";
-
-    const char *slash = strrchr(shell, '/');
-
-    return slash ? slash + 1 : shell;
+    fclose(f);
 }
 
 int main(void) {
-    animate_output =
-        isatty(STDOUT_FILENO) && getenv("NO_ANIMATION") == NULL;
+    signal(SIGINT, stop_animation);
+    signal(SIGTERM, stop_animation);
 
-    char username[128] = "user";
-
-    const char *env_user = getenv("USER");
-
-    if (env_user && *env_user) {
-        snprintf(username, sizeof(username), "%s", env_user);
-    } else {
-        struct passwd *pw = getpwuid(getuid());
-
-        if (pw && pw->pw_name)
-            snprintf(username, sizeof(username), "%s", pw->pw_name);
-    }
-
-    char hostname[128] = "localhost";
-
-    if (gethostname(hostname, sizeof(hostname) - 1) != 0)
-        snprintf(hostname, sizeof(hostname), "localhost");
-
-    hostname[sizeof(hostname) - 1] = '\0';
-
-    struct utsname system_info;
-
-    if (uname(&system_info) != 0) {
-        memset(&system_info, 0, sizeof(system_info));
-
-        snprintf(system_info.sysname,
-                 sizeof(system_info.sysname), "Linux");
-
-        snprintf(system_info.release,
-                 sizeof(system_info.release), "unknown");
-
-        snprintf(system_info.machine,
-                 sizeof(system_info.machine), "unknown");
-    }
+    struct utsname sys;
+    uname(&sys);
 
     char os[256];
-    char cpu[256];
     char memory[128];
     char uptime[128];
-    char title[300];
-    char details[8][512];
 
-    read_os_name(os, sizeof(os));
-    read_cpu_name(cpu, sizeof(cpu));
-    read_memory(memory, sizeof(memory));
-    read_uptime(uptime, sizeof(uptime));
-
-    snprintf(title, sizeof(title), "%s@%s", username, hostname);
-
-    snprintf(details[0], sizeof(details[0]), "OS        %s", os);
-    snprintf(details[1], sizeof(details[1]), "Host      %s", hostname);
-    snprintf(details[2], sizeof(details[2]),
-             "Kernel    %s %s",
-             system_info.sysname, system_info.release);
-
-    snprintf(details[3], sizeof(details[3]), "CPU       %s", cpu);
-    snprintf(details[4], sizeof(details[4]), "Uptime    %s", uptime);
-    snprintf(details[5], sizeof(details[5]), "Memory    %s", memory);
-    snprintf(details[6], sizeof(details[6]), "Shell     %s", shell_name());
-
-    snprintf(details[7], sizeof(details[7]),
-             "Terminal  %s",
-             getenv("TERM") ? getenv("TERM") : "Unknown");
-
-    const char *logo[] = {
-        "          .--.        ",
-        "         |o_o |       ",
-        "         |:_/ |       ",
-        "        //   \\ \\      ",
-        "       (|     | )     ",
-        "      /'\\_   _/`\\    ",
-        "      \\___)=(___/    ",
-        "                       "
+    const char *frames[] = {
+        "          .--.          ",
+        "         |o_o |         ",
+        "         |:_/ |         ",
+        "        //   \\ \\        ",
+        "       (|     | )       ",
+        "      /'\\_   _/`\\      ",
+        "      \\___)=(___/      "
     };
 
-    puts("");
+    const char *spinner[] = {
+        "⠋", "⠙", "⠹", "⠸",
+        "⠼", "⠴", "⠦", "⠧",
+        "⠇", "⠏"
+    };
 
-    for (int row = 0; row < 10; ++row) {
-        const char *left =
-            row < 8 ? logo[row] : "                       ";
+    int frame = 0;
 
-        printf("%s%s%s  ", ORANGE, left, RESET);
+    printf("\033[?25l");
 
-        if (row == 0) {
-            printf("%s%s%s%s", BOLD, CYAN, title, RESET);
-        } else if (row == 1) {
-            printf("%s--------------------------%s", MUTED, RESET);
-        } else if (row >= 2 && row <= 9) {
-            printf("%s", WHITE);
-            print_animated(details[row - 2], 3);
-            printf("%s", RESET);
+    while (running) {
+        get_os(os, sizeof(os));
+        get_memory(memory, sizeof(memory));
+        get_uptime(uptime, sizeof(uptime));
+
+        printf("\033[2J\033[H");
+
+        int bounce = (frame / 3) % 2;
+
+        printf("\n");
+        printf("  %s%sANIMATED NEOFETCH%s\n",
+               BOLD, CYAN, RESET);
+
+        printf("  %s%s%s  Live Linux System Monitor\n\n",
+               PINK, spinner[frame % 10], RESET);
+
+        for (int i = 0; i < 7; i++) {
+            if (i == 0 || i == 6)
+                printf("  ");
+
+            else if (bounce)
+                printf(" ");
+
+            printf("%s%s%s\n", CYAN, frames[i], RESET);
         }
 
-        putchar('\n');
-        pause_ms(55);
+        printf("\n");
+        printf("  %s────────────────────────────────────%s\n",
+               PINK, RESET);
+
+        printf("  %sOS       %s%s\n", CYAN, WHITE, os);
+        printf("  %sKernel   %s%s %s\n",
+               CYAN, WHITE, sys.sysname, sys.release);
+
+        printf("  %sMachine  %s%s\n",
+               CYAN, WHITE, sys.machine);
+
+        printf("  %sUptime   %s%s\n",
+               CYAN, WHITE, uptime);
+
+        printf("  %sMemory   %s%s\n",
+               CYAN, WHITE, memory);
+
+        printf("  %s\n", RESET);
+
+        int progress = frame % 31;
+
+        printf("  %sSYSTEM ANIMATION %s\n",
+               PINK, RESET);
+
+        printf("  [");
+
+        for (int i = 0; i < 30; i++) {
+            if (i == progress)
+                printf("%s>%s", CYAN, RESET);
+            else
+                printf("%s", i < progress ? "=" : ".");
+        }
+
+        printf("] %02d%%\n", progress * 100 / 30);
+
+        printf("\n  %sFrame: %d | Press CTRL+C to exit%s\n",
+               CYAN, frame, RESET);
+
+        fflush(stdout);
+
+        frame++;
+        sleep_frame();
     }
 
-    printf("\n%s", MUTED);
-
-    const char *swatches[] = {
-        "  ", "  ", "  ", "  ",
-        "  ", "  ", "  ", "  "
-    };
-
-    const char *swatch_colors[] = {
-        "\033[40m", "\033[41m", "\033[42m", "\033[43m",
-        "\033[44m", "\033[45m", "\033[46m", "\033[47m"
-    };
-
-    for (size_t i = 0;
-         i < sizeof(swatches) / sizeof(swatches[0]); ++i) {
-        printf("%s%s%s", swatch_colors[i], swatches[i], RESET);
-    }
-
-    printf("\n\n%s", RESET);
+    printf("\033[2J\033[H");
+    printf("\033[?25h");
+    printf("%sAnimated Neofetch stopped.%s\n", CYAN, RESET);
 
     return 0;
 }
